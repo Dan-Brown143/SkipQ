@@ -1,64 +1,394 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Clock, Bell, CheckCircle, XCircle, TrendingUp, DollarSign, Settings, BarChart3 } from 'lucide-react';
-
-// This is the BUSINESS DASHBOARD - businesses manage their queues
+import { Users, Clock, Bell, CheckCircle, XCircle, TrendingUp, BarChart3, LogOut, Eye, EyeOff, Upload, Image } from 'lucide-react';
+import { db, auth } from './firebase';
+import { collection, query, where, onSnapshot, updateDoc, doc, deleteDoc, serverTimestamp, addDoc, orderBy, getDoc } from 'firebase/firestore';
+import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 
 const BusinessDashboard = () => {
-  const [queue, setQueue] = useState([
-    { id: 1, name: "John Smith", joined: "10:30 AM", phone: "07123456789", status: "ready" },
-    { id: 2, name: "Sarah Johnson", joined: "10:35 AM", phone: "07234567890", status: "waiting" },
-    { id: 3, name: "Mike Brown", joined: "10:42 AM", phone: "07345678901", status: "waiting" },
-    { id: 4, name: "Emma Wilson", joined: "10:48 AM", phone: "07456789012", status: "waiting" },
-  ]);
-
-  const [businessInfo, setBusinessInfo] = useState({
-    name: "Tony's Barbershop",
-    avgServiceTime: 15,
-    todayServed: 23,
-    currentQueue: 4,
-    avgWaitTime: 15,
-    revenue: 29 // Monthly subscription
-  });
-
+  const [user, setUser] = useState(null);
+  const [businessData, setBusinessData] = useState(null);
+  const [queue, setQueue] = useState([]);
   const [stats, setStats] = useState({
-    weekServed: 145,
-    monthServed: 623,
-    avgRating: 4.8,
-    noShowRate: 3.2
+    todayServed: 0,
+    weekServed: 0,
+    avgRating: 0,
+    noShowRate: 0,
+    actualAvgWaitTime: 0
   });
+  
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [autoCalculateWaitTime, setAutoCalculateWaitTime] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
 
-  const callNext = () => {
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      if (!user) {
+        setBusinessData(null);
+        setQueue([]);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const q = query(
+      collection(db, 'businesses'),
+      where('ownerId', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      if (!snapshot.empty) {
+        const business = {
+          id: snapshot.docs[0].id,
+          ...snapshot.docs[0].data()
+        };
+        setBusinessData(business);
+        setAutoCalculateWaitTime(business.autoCalculateWaitTime || false);
+      }
+    }, (error) => {
+      console.error('Error fetching business:', error);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  useEffect(() => {
+    if (!businessData) return;
+
+    const q = query(
+      collection(db, 'queue_entries'),
+      where('businessId', '==', businessData.id),
+      where('status', 'in', ['waiting', 'ready']),
+      orderBy('joinedAt', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const queueData = snapshot.docs.map((doc, index) => ({
+        id: doc.id,
+        position: index + 1,
+        ...doc.data()
+      }));
+      setQueue(queueData);
+      
+      queueData.forEach((entry, index) => {
+        if (entry.position !== index + 1) {
+          updateDoc(doc(db, 'queue_entries', entry.id), {
+            position: index + 1,
+            estimatedWait: (index + 1) * (businessData.avgWaitTime || 15)
+          });
+        }
+      });
+    }, (error) => {
+      console.error('Error fetching queue:', error);
+    });
+
+    return () => unsubscribe();
+  }, [businessData]);
+
+  useEffect(() => {
+    if (!businessData) return;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const todayQuery = query(
+      collection(db, 'queue_entries'),
+      where('businessId', '==', businessData.id),
+      where('status', '==', 'completed'),
+      where('completedAt', '>=', today)
+    );
+
+    const unsubscribe = onSnapshot(todayQuery, (snapshot) => {
+      const completedToday = snapshot.docs.map(doc => doc.data());
+      
+      const timesWithData = completedToday.filter(entry => 
+        entry.calledAt && entry.completedAt
+      );
+      
+      let avgActualWaitTime = 0;
+      if (timesWithData.length > 0) {
+        const totalWaitMinutes = timesWithData.reduce((sum, entry) => {
+          const waitTime = (entry.completedAt.seconds - entry.calledAt.seconds) / 60;
+          return sum + waitTime;
+        }, 0);
+        avgActualWaitTime = Math.round(totalWaitMinutes / timesWithData.length);
+      }
+
+      const ratedEntries = completedToday.filter(e => e.rating);
+      const avgRating = ratedEntries.length > 0
+        ? ratedEntries.reduce((sum, e) => sum + e.rating, 0) / ratedEntries.length
+        : businessData.rating || 5.0;
+
+      setStats(prev => ({
+        ...prev,
+        todayServed: snapshot.size,
+        avgRating: Math.round(avgRating * 10) / 10,
+        actualAvgWaitTime: avgActualWaitTime
+      }));
+
+      if (autoCalculateWaitTime && timesWithData.length >= 5) {
+        updateDoc(doc(db, 'businesses', businessData.id), {
+          avgWaitTime: avgActualWaitTime
+        });
+      }
+    });
+
+    return () => unsubscribe();
+  }, [businessData, autoCalculateWaitTime]);
+
+  const handleImageUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    // Check file size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      alert('Image must be smaller than 5MB');
+      return;
+    }
+
+    // Check file type
+    if (!file.type.startsWith('image/')) {
+      alert('Please upload an image file');
+      return;
+    }
+
+    setUploadingImage(true);
+
+    try {
+      // Upload to ImgBB (free image hosting)
+      const formData = new FormData();
+      formData.append('image', file);
+      
+      // ImgBB API key - this is a demo key, you should get your own at https://api.imgbb.com/
+      const response = await fetch('https://api.imgbb.com/1/upload?key=YOUR_IMGBB_API_KEY', {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await response.json();
+
+      if (data.success) {
+        // Update business with new image URL
+        await updateDoc(doc(db, 'businesses', businessData.id), {
+          image: data.data.url
+        });
+        alert('Image uploaded successfully!');
+      } else {
+        throw new Error('Upload failed');
+      }
+    } catch (error) {
+      console.error('Error uploading image:', error);
+      alert('Failed to upload image. Please try again.');
+    } finally {
+      setUploadingImage(false);
+    }
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setLoginError('');
+    setIsLoggingIn(true);
+
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+    } catch (error) {
+      console.error('Login error:', error);
+      if (error.code === 'auth/invalid-credential') {
+        setLoginError('Invalid email or password');
+      } else if (error.code === 'auth/user-not-found') {
+        setLoginError('No account found with this email');
+      } else if (error.code === 'auth/wrong-password') {
+        setLoginError('Incorrect password');
+      } else {
+        setLoginError('Login failed. Please try again.');
+      }
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+    } catch (error) {
+      console.error('Logout error:', error);
+    }
+  };
+
+  const callNext = async () => {
     if (queue.length === 0) return;
     
-    // Mark first person as ready, notify them
-    setQueue(prev => prev.map((person, idx) => 
-      idx === 0 ? { ...person, status: 'ready' } : person
-    ));
+    const nextCustomer = queue[0];
     
-    // In production, this sends push notification to customer
-    alert(`${queue[0].name} has been notified!`);
+    try {
+      await updateDoc(doc(db, 'queue_entries', nextCustomer.id), {
+        status: 'ready',
+        calledAt: serverTimestamp()
+      });
+    } catch (error) {
+      console.error('Error calling next customer:', error);
+      alert('Failed to call next customer');
+    }
   };
 
-  const removeCustomer = (id) => {
-    setQueue(queue.filter(p => p.id !== id));
-    setBusinessInfo(prev => ({
-      ...prev,
-      todayServed: prev.todayServed + 1,
-      currentQueue: prev.currentQueue - 1
-    }));
+  const markServed = async (customerId) => {
+    try {
+      await updateDoc(doc(db, 'queue_entries', customerId), {
+        status: 'completed',
+        completedAt: serverTimestamp()
+      });
+
+      if (businessData) {
+        await updateDoc(doc(db, 'businesses', businessData.id), {
+          currentQueue: Math.max(0, (businessData.currentQueue || 0) - 1),
+          todayServed: (businessData.todayServed || 0) + 1
+        });
+      }
+    } catch (error) {
+      console.error('Error marking customer as served:', error);
+      alert('Failed to mark customer as served');
+    }
   };
 
-  const markNoShow = (id) => {
-    setQueue(queue.filter(p => p.id !== id));
-    setBusinessInfo(prev => ({
-      ...prev,
-      currentQueue: prev.currentQueue - 1
-    }));
+  const markNoShow = async (customerId) => {
+    try {
+      await updateDoc(doc(db, 'queue_entries', customerId), {
+        status: 'no_show',
+        noShowAt: serverTimestamp()
+      });
+
+      if (businessData) {
+        await updateDoc(doc(db, 'businesses', businessData.id), {
+          currentQueue: Math.max(0, (businessData.currentQueue || 0) - 1)
+        });
+      }
+    } catch (error) {
+      console.error('Error marking no-show:', error);
+      alert('Failed to mark as no-show');
+    }
   };
+
+  const updateAvgServiceTime = async (newTime) => {
+    if (!businessData) return;
+    
+    try {
+      await updateDoc(doc(db, 'businesses', businessData.id), {
+        avgWaitTime: parseInt(newTime)
+      });
+    } catch (error) {
+      console.error('Error updating service time:', error);
+    }
+  };
+
+  const toggleAutoCalculate = async () => {
+    if (!businessData) return;
+    
+    const newValue = !autoCalculateWaitTime;
+    setAutoCalculateWaitTime(newValue);
+    
+    try {
+      await updateDoc(doc(db, 'businesses', businessData.id), {
+        autoCalculateWaitTime: newValue
+      });
+    } catch (error) {
+      console.error('Error updating auto-calculate setting:', error);
+    }
+  };
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-600 to-indigo-700 flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
+          <div className="text-center mb-8">
+            <div className="w-16 h-16 bg-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4">
+              <Users className="w-10 h-10 text-white" />
+            </div>
+            <h1 className="text-3xl font-bold text-gray-800">SkipQ Business</h1>
+            <p className="text-gray-600 mt-2">Sign in to manage your queue</p>
+          </div>
+
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Email
+              </label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                placeholder="your@email.com"
+                required
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Password
+              </label>
+              <div className="relative">
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none pr-12"
+                  placeholder="••••••••"
+                  required
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword(!showPassword)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+                >
+                  {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                </button>
+              </div>
+            </div>
+
+            {loginError && (
+              <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                {loginError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={isLoggingIn}
+              className="w-full py-3 bg-blue-600 text-white rounded-lg font-semibold hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {isLoggingIn ? 'Signing in...' : 'Sign In'}
+            </button>
+          </form>
+
+          <div className="mt-6 text-center text-sm text-gray-600">
+            <p>Demo account:</p>
+            <p className="font-mono text-xs mt-1">demo@skipq.com / demo123</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!businessData) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-gray-600">Loading your business...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-gray-100">
-      {/* Header */}
       <div className="bg-white shadow-md">
         <div className="max-w-7xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -68,27 +398,30 @@ const BusinessDashboard = () => {
               </div>
               <div>
                 <h1 className="text-2xl font-bold text-gray-800">SkipQ Business</h1>
-                <p className="text-sm text-gray-600">{businessInfo.name}</p>
+                <p className="text-sm text-gray-600">{businessData.name}</p>
               </div>
             </div>
-            <button className="p-2 hover:bg-gray-100 rounded-lg transition">
-              <Settings className="w-6 h-6 text-gray-600" />
+            <button
+              onClick={handleLogout}
+              className="flex items-center gap-2 px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition"
+            >
+              <LogOut className="w-5 h-5" />
+              <span>Logout</span>
             </button>
           </div>
         </div>
       </div>
 
       <div className="max-w-7xl mx-auto px-6 py-6">
-        {/* Stats Grid */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
           <div className="bg-white rounded-lg shadow p-6">
             <div className="flex items-center justify-between mb-2">
               <div className="text-sm text-gray-600">Current Queue</div>
               <Users className="w-5 h-5 text-blue-600" />
             </div>
-            <div className="text-3xl font-bold text-blue-600">{businessInfo.currentQueue}</div>
+            <div className="text-3xl font-bold text-blue-600">{queue.length}</div>
             <div className="text-xs text-gray-500 mt-1">
-              ~{businessInfo.currentQueue * businessInfo.avgWaitTime} min total wait
+              ~{queue.length * (businessData.avgWaitTime || 15)} min total wait
             </div>
           </div>
 
@@ -97,7 +430,7 @@ const BusinessDashboard = () => {
               <div className="text-sm text-gray-600">Served Today</div>
               <CheckCircle className="w-5 h-5 text-green-600" />
             </div>
-            <div className="text-3xl font-bold text-green-600">{businessInfo.todayServed}</div>
+            <div className="text-3xl font-bold text-green-600">{stats.todayServed}</div>
             <div className="text-xs text-gray-500 mt-1">+{stats.weekServed} this week</div>
           </div>
 
@@ -106,8 +439,12 @@ const BusinessDashboard = () => {
               <div className="text-sm text-gray-600">Avg Wait Time</div>
               <Clock className="w-5 h-5 text-orange-600" />
             </div>
-            <div className="text-3xl font-bold text-orange-600">{businessInfo.avgWaitTime} min</div>
-            <div className="text-xs text-gray-500 mt-1">Per customer</div>
+            <div className="text-3xl font-bold text-orange-600">{businessData.avgWaitTime || 15} min</div>
+            {stats.actualAvgWaitTime > 0 && (
+              <div className="text-xs text-gray-500 mt-1">
+                Actual: {stats.actualAvgWaitTime} min
+              </div>
+            )}
           </div>
 
           <div className="bg-white rounded-lg shadow p-6">
@@ -115,14 +452,12 @@ const BusinessDashboard = () => {
               <div className="text-sm text-gray-600">Customer Rating</div>
               <TrendingUp className="w-5 h-5 text-yellow-600" />
             </div>
-            <div className="text-3xl font-bold text-yellow-600">{stats.avgRating}</div>
+            <div className="text-3xl font-bold text-yellow-600">{stats.avgRating || businessData.rating || 5.0}</div>
             <div className="text-xs text-gray-500 mt-1">Out of 5.0</div>
           </div>
         </div>
 
-        {/* Queue Management */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Active Queue */}
           <div className="lg:col-span-2">
             <div className="bg-white rounded-lg shadow">
               <div className="p-6 border-b border-gray-200">
@@ -148,7 +483,7 @@ const BusinessDashboard = () => {
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {queue.map((person, index) => (
+                    {queue.map((person) => (
                       <div
                         key={person.id}
                         className={`p-4 rounded-lg border-2 transition ${
@@ -164,15 +499,12 @@ const BusinessDashboard = () => {
                                 ? 'bg-green-500 text-white'
                                 : 'bg-gray-200 text-gray-700'
                             }`}>
-                              {index + 1}
+                              {person.position}
                             </div>
                             <div>
-                              <div className="font-semibold text-lg">{person.name}</div>
+                              <div className="font-semibold text-lg">{person.userName || 'Customer'}</div>
                               <div className="text-sm text-gray-600">
-                                Joined at {person.joined}
-                              </div>
-                              <div className="text-xs text-gray-500 mt-1">
-                                {person.phone}
+                                Joined {person.joinedAt ? new Date(person.joinedAt.seconds * 1000).toLocaleTimeString() : 'recently'}
                               </div>
                             </div>
                           </div>
@@ -184,7 +516,7 @@ const BusinessDashboard = () => {
                               </span>
                             )}
                             <button
-                              onClick={() => removeCustomer(person.id)}
+                              onClick={() => markServed(person.id)}
                               className="px-4 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition flex items-center gap-2"
                             >
                               <CheckCircle className="w-4 h-4" />
@@ -207,8 +539,52 @@ const BusinessDashboard = () => {
             </div>
           </div>
 
-          {/* Quick Actions & Info */}
           <div className="space-y-6">
+            {/* Business Image Upload */}
+            <div className="bg-white rounded-lg shadow p-6">
+              <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
+                <Image className="w-5 h-5 text-gray-600" />
+                Business Image
+              </h3>
+              <div className="space-y-4">
+                <div className="flex justify-center">
+                  {businessData.image?.startsWith('http') ? (
+                    <img 
+                      src={businessData.image} 
+                      alt={businessData.name}
+                      className="w-32 h-32 rounded-lg object-cover border-2 border-gray-200"
+                    />
+                  ) : (
+                    <div className="w-32 h-32 rounded-lg bg-gray-100 flex items-center justify-center text-6xl border-2 border-gray-200">
+                      {businessData.image || '🏪'}
+                    </div>
+                  )}
+                </div>
+                
+                <div>
+                  <input
+                    type="file"
+                    id="image-upload"
+                    accept="image/*"
+                    onChange={handleImageUpload}
+                    className="hidden"
+                  />
+                  <label
+                    htmlFor="image-upload"
+                    className={`w-full py-2 px-4 border-2 border-blue-300 text-blue-600 rounded-lg font-medium hover:bg-blue-50 transition cursor-pointer flex items-center justify-center gap-2 ${
+                      uploadingImage ? 'opacity-50 cursor-not-allowed' : ''
+                    }`}
+                  >
+                    <Upload className="w-4 h-4" />
+                    {uploadingImage ? 'Uploading...' : 'Upload New Image'}
+                  </label>
+                  <p className="text-xs text-gray-500 mt-2 text-center">
+                    Max 5MB • JPG, PNG, GIF
+                  </p>
+                </div>
+              </div>
+            </div>
+
             {/* Quick Settings */}
             <div className="bg-white rounded-lg shadow p-6">
               <h3 className="font-bold text-lg mb-4">Quick Settings</h3>
@@ -216,89 +592,61 @@ const BusinessDashboard = () => {
                 <div>
                   <label className="text-sm text-gray-600 mb-1 block">
                     Avg Service Time (minutes)
+                    {autoCalculateWaitTime && (
+                      <span className="ml-2 text-xs text-blue-600">(Auto-calculating)</span>
+                    )}
                   </label>
                   <input
                     type="number"
-                    value={businessInfo.avgServiceTime}
-                    onChange={(e) => setBusinessInfo({
-                      ...businessInfo,
-                      avgServiceTime: parseInt(e.target.value)
-                    })}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                    value={businessData.avgWaitTime || 15}
+                    onChange={(e) => updateAvgServiceTime(e.target.value)}
+                    disabled={autoCalculateWaitTime}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100 disabled:cursor-not-allowed"
+                    min="1"
+                    max="120"
                   />
                 </div>
 
                 <div>
-                  <label className="flex items-center gap-2">
-                    <input type="checkbox" className="w-4 h-4" defaultChecked />
-                    <span className="text-sm">Send SMS notifications</span>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoCalculateWaitTime}
+                      onChange={toggleAutoCalculate}
+                      className="w-4 h-4"
+                    />
+                    <span className="text-sm">Auto-calculate wait time from actual data</span>
                   </label>
+                  {stats.actualAvgWaitTime > 0 && (
+                    <p className="text-xs text-gray-500 mt-1 ml-6">
+                      Based on {stats.todayServed} customers served today
+                    </p>
+                  )}
                 </div>
-
-                <div>
-                  <label className="flex items-center gap-2">
-                    <input type="checkbox" className="w-4 h-4" defaultChecked />
-                    <span className="text-sm">Auto-call next customer</span>
-                  </label>
-                </div>
-
-                <button className="w-full py-2 bg-gray-100 text-gray-700 rounded-lg font-medium hover:bg-gray-200 transition">
-                  Advanced Settings
-                </button>
               </div>
             </div>
 
-            {/* Subscription Info */}
-            <div className="bg-gradient-to-br from-blue-600 to-indigo-600 rounded-lg shadow p-6 text-white">
-              <div className="flex items-center gap-2 mb-3">
-                <DollarSign className="w-5 h-5" />
-                <h3 className="font-bold">Your Plan</h3>
-              </div>
-              <div className="text-3xl font-bold mb-2">£{businessInfo.revenue}/month</div>
-              <p className="text-sm text-blue-100 mb-4">
-                Pro Plan - Unlimited customers
-              </p>
-              <div className="space-y-2 text-sm mb-4">
-                <div className="flex items-center gap-2">
-                  <CheckCircle className="w-4 h-4" />
-                  <span>Real-time queue updates</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <CheckCircle className="w-4 h-4" />
-                  <span>SMS notifications</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <CheckCircle className="w-4 h-4" />
-                  <span>Analytics dashboard</span>
-                </div>
-              </div>
-              <button className="w-full py-2 bg-white text-blue-600 rounded-lg font-semibold hover:bg-blue-50 transition">
-                Manage Billing
-              </button>
-            </div>
-
-            {/* Weekly Stats */}
+            {/* Statistics */}
             <div className="bg-white rounded-lg shadow p-6">
               <h3 className="font-bold text-lg mb-4 flex items-center gap-2">
                 <BarChart3 className="w-5 h-5 text-gray-600" />
-                This Week
+                Statistics
               </h3>
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600">Customers Served</span>
-                  <span className="font-bold">{stats.weekServed}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600">No-Show Rate</span>
-                  <span className="font-bold">{stats.noShowRate}%</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600">Avg Rating</span>
+                  <span className="text-sm text-gray-600">Avg Rating (Today)</span>
                   <span className="font-bold">{stats.avgRating}/5.0</span>
                 </div>
-                <button className="w-full mt-2 py-2 text-blue-600 font-medium hover:bg-blue-50 rounded-lg transition">
-                  View Full Analytics
-                </button>
+                {stats.actualAvgWaitTime > 0 && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm text-gray-600">Actual Avg Wait</span>
+                    <span className="font-bold">{stats.actualAvgWaitTime} min</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600">Total Ratings</span>
+                  <span className="font-bold">{businessData.totalRatings || 0}</span>
+                </div>
               </div>
             </div>
           </div>
