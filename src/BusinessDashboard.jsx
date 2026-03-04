@@ -167,7 +167,7 @@ const BusinessDashboard = () => {
       formData.append('image', file);
       
       // ImgBB API key - this is a demo key, you should get your own at https://api.imgbb.com/
-      const response = await fetch('https://api.imgbb.com/1/upload?key=YOUR_IMGBB_API_KEY', {
+      const response = await fetch('https://api.imgbb.com/1/upload?key=540e18d4ae9c31f4c2ee1d1b5528908a', {
         method: 'POST',
         body: formData
       });
