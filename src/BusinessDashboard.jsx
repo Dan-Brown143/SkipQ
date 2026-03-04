@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Users, Clock, Bell, CheckCircle, XCircle, TrendingUp, BarChart3, LogOut, Eye, EyeOff, Upload, Image } from 'lucide-react';
+import { Users, Clock, Bell, CheckCircle, XCircle, TrendingUp, BarChart3, LogOut, Eye, EyeOff, Upload, Image, AlertCircle, X } from 'lucide-react';
 import { db, auth } from './firebase';
-import { collection, query, where, onSnapshot, updateDoc, doc, deleteDoc, serverTimestamp, addDoc, orderBy, getDoc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, updateDoc, doc, deleteDoc, serverTimestamp, getDoc } from 'firebase/firestore';
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 
 const BusinessDashboard = () => {
@@ -23,6 +23,14 @@ const BusinessDashboard = () => {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [autoCalculateWaitTime, setAutoCalculateWaitTime] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
+  
+  // In-app notification system
+  const [notification, setNotification] = useState(null);
+
+  const showNotification = (message, type = 'info') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 5000);
+  };
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -54,6 +62,7 @@ const BusinessDashboard = () => {
       }
     }, (error) => {
       console.error('Error fetching business:', error);
+      showNotification('Error loading business data', 'error');
     });
 
     return () => unsubscribe();
@@ -65,49 +74,70 @@ const BusinessDashboard = () => {
     const q = query(
       collection(db, 'queue_entries'),
       where('businessId', '==', businessData.id),
-      where('status', 'in', ['waiting', 'ready']),
-      orderBy('joinedAt', 'asc')
+      where('status', 'in', ['waiting', 'ready'])
     );
 
     const unsubscribe = onSnapshot(q, (snapshot) => {
-      const queueData = snapshot.docs.map((doc, index) => ({
-        id: doc.id,
-        position: index + 1,
-        ...doc.data()
-      }));
+      const queueData = snapshot.docs
+        .map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }))
+        .sort((a, b) => {
+          if (!a.joinedAt || !b.joinedAt) return 0;
+          return a.joinedAt.seconds - b.joinedAt.seconds;
+        })
+        .map((entry, index) => ({
+          ...entry,
+          position: index + 1
+        }));
+      
       setQueue(queueData);
       
       queueData.forEach((entry, index) => {
-        if (entry.position !== index + 1) {
+        const newPosition = index + 1;
+        const newEstimatedWait = newPosition * (businessData.avgWaitTime || 15);
+        
+        if (entry.position !== newPosition || entry.estimatedWait !== newEstimatedWait) {
           updateDoc(doc(db, 'queue_entries', entry.id), {
-            position: index + 1,
-            estimatedWait: (index + 1) * (businessData.avgWaitTime || 15)
-          });
+            position: newPosition,
+            estimatedWait: newEstimatedWait
+          }).catch(err => console.error('Error updating position:', err));
         }
       });
     }, (error) => {
       console.error('Error fetching queue:', error);
+      showNotification('Error loading queue', 'error');
     });
 
     return () => unsubscribe();
   }, [businessData]);
 
+  // Calculate statistics - FIXED VERSION
   useEffect(() => {
     if (!businessData) return;
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    const todayQuery = query(
+    // Query ALL completed entries (not filtered by date in query)
+    const completedQuery = query(
       collection(db, 'queue_entries'),
       where('businessId', '==', businessData.id),
-      where('status', '==', 'completed'),
-      where('completedAt', '>=', today)
+      where('status', '==', 'completed')
     );
 
-    const unsubscribe = onSnapshot(todayQuery, (snapshot) => {
-      const completedToday = snapshot.docs.map(doc => doc.data());
+    const unsubscribe = onSnapshot(completedQuery, (snapshot) => {
+      const allCompleted = snapshot.docs.map(doc => doc.data());
       
+      // Filter for today in JavaScript
+      const completedToday = allCompleted.filter(entry => {
+        if (!entry.completedAt || !entry.completedAt.seconds) return false;
+        const completedDate = new Date(entry.completedAt.seconds * 1000);
+        return completedDate >= today;
+      });
+      
+      // Calculate actual wait time from today's data
       const timesWithData = completedToday.filter(entry => 
         entry.calledAt && entry.completedAt
       );
@@ -121,23 +151,27 @@ const BusinessDashboard = () => {
         avgActualWaitTime = Math.round(totalWaitMinutes / timesWithData.length);
       }
 
-      const ratedEntries = completedToday.filter(e => e.rating);
+      // Calculate average rating from ALL completed entries (not just today)
+      const ratedEntries = allCompleted.filter(e => e.rating);
       const avgRating = ratedEntries.length > 0
         ? ratedEntries.reduce((sum, e) => sum + e.rating, 0) / ratedEntries.length
         : businessData.rating || 5.0;
 
       setStats(prev => ({
         ...prev,
-        todayServed: snapshot.size,
+        todayServed: completedToday.length,
         avgRating: Math.round(avgRating * 10) / 10,
         actualAvgWaitTime: avgActualWaitTime
       }));
 
+      // Auto-update wait time if enabled
       if (autoCalculateWaitTime && timesWithData.length >= 5) {
         updateDoc(doc(db, 'businesses', businessData.id), {
           avgWaitTime: avgActualWaitTime
-        });
+        }).catch(err => console.error('Error updating avgWaitTime:', err));
       }
+    }, (error) => {
+      console.error('Error fetching stats:', error);
     });
 
     return () => unsubscribe();
@@ -149,45 +183,53 @@ const BusinessDashboard = () => {
 
     // Check file size (max 5MB)
     if (file.size > 5 * 1024 * 1024) {
-      alert('Image must be smaller than 5MB');
+      showNotification('Image must be smaller than 5MB', 'error');
       return;
     }
 
     // Check file type
     if (!file.type.startsWith('image/')) {
-      alert('Please upload an image file');
+      showNotification('Please upload an image file (JPG, PNG, GIF)', 'error');
       return;
     }
 
     setUploadingImage(true);
+    showNotification('Uploading image...', 'info');
 
     try {
-      // Upload to ImgBB (free image hosting)
       const formData = new FormData();
       formData.append('image', file);
       
-      // ImgBB API key - this is a demo key, you should get your own at https://api.imgbb.com/
-      const response = await fetch('https://api.imgbb.com/1/upload?key=540e18d4ae9c31f4c2ee1d1b5528908a', {
+      // Replace with your actual ImgBB API key
+      const API_KEY = '540e18d4ae9c31f4c2ee1d1b5528908a'; // TODO: Add your key here
+      
+      const response = await fetch(`https://api.imgbb.com/1/upload?key=${API_KEY}`, {
         method: 'POST',
         body: formData
       });
 
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.statusText}`);
+      }
+
       const data = await response.json();
 
-      if (data.success) {
+      if (data.success && data.data && data.data.url) {
         // Update business with new image URL
         await updateDoc(doc(db, 'businesses', businessData.id), {
           image: data.data.url
         });
-        alert('Image uploaded successfully!');
+        showNotification('Image uploaded successfully!', 'success');
       } else {
-        throw new Error('Upload failed');
+        throw new Error('Upload failed - invalid response from ImgBB');
       }
     } catch (error) {
       console.error('Error uploading image:', error);
-      alert('Failed to upload image. Please try again.');
+      showNotification(`Upload failed: ${error.message}`, 'error');
     } finally {
       setUploadingImage(false);
+      // Reset file input
+      e.target.value = '';
     }
   };
 
@@ -219,6 +261,7 @@ const BusinessDashboard = () => {
       await signOut(auth);
     } catch (error) {
       console.error('Logout error:', error);
+      showNotification('Failed to logout', 'error');
     }
   };
 
@@ -232,13 +275,14 @@ const BusinessDashboard = () => {
         status: 'ready',
         calledAt: serverTimestamp()
       });
+      showNotification(`Called ${nextCustomer.userName}`, 'success');
     } catch (error) {
       console.error('Error calling next customer:', error);
-      alert('Failed to call next customer');
+      showNotification('Failed to call next customer', 'error');
     }
   };
 
-  const markServed = async (customerId) => {
+  const markServed = async (customerId, customerName) => {
     try {
       await updateDoc(doc(db, 'queue_entries', customerId), {
         status: 'completed',
@@ -251,13 +295,15 @@ const BusinessDashboard = () => {
           todayServed: (businessData.todayServed || 0) + 1
         });
       }
+      
+      showNotification(`${customerName} marked as served`, 'success');
     } catch (error) {
       console.error('Error marking customer as served:', error);
-      alert('Failed to mark customer as served');
+      showNotification('Failed to mark as served', 'error');
     }
   };
 
-  const markNoShow = async (customerId) => {
+  const markNoShow = async (customerId, customerName) => {
     try {
       await updateDoc(doc(db, 'queue_entries', customerId), {
         status: 'no_show',
@@ -269,9 +315,11 @@ const BusinessDashboard = () => {
           currentQueue: Math.max(0, (businessData.currentQueue || 0) - 1)
         });
       }
+      
+      showNotification(`${customerName} marked as no-show`, 'info');
     } catch (error) {
       console.error('Error marking no-show:', error);
-      alert('Failed to mark as no-show');
+      showNotification('Failed to mark as no-show', 'error');
     }
   };
 
@@ -284,6 +332,7 @@ const BusinessDashboard = () => {
       });
     } catch (error) {
       console.error('Error updating service time:', error);
+      showNotification('Failed to update service time', 'error');
     }
   };
 
@@ -297,9 +346,48 @@ const BusinessDashboard = () => {
       await updateDoc(doc(db, 'businesses', businessData.id), {
         autoCalculateWaitTime: newValue
       });
+      showNotification(
+        newValue ? 'Auto-calculate enabled' : 'Auto-calculate disabled', 
+        'success'
+      );
     } catch (error) {
       console.error('Error updating auto-calculate setting:', error);
+      showNotification('Failed to update setting', 'error');
     }
+  };
+
+  // In-app notification component
+  const Notification = () => {
+    if (!notification) return null;
+
+    const bgColors = {
+      success: 'bg-green-50 border-green-300 text-green-800',
+      error: 'bg-red-50 border-red-300 text-red-800',
+      info: 'bg-blue-50 border-blue-300 text-blue-800'
+    };
+
+    const icons = {
+      success: CheckCircle,
+      error: AlertCircle,
+      info: Bell
+    };
+
+    const Icon = icons[notification.type];
+
+    return (
+      <div className="fixed top-4 right-4 z-50 animate-slide-in">
+        <div className={`flex items-center gap-3 px-4 py-3 rounded-lg border-2 shadow-lg ${bgColors[notification.type]}`}>
+          <Icon className="w-5 h-5 flex-shrink-0" />
+          <span className="font-medium">{notification.message}</span>
+          <button
+            onClick={() => setNotification(null)}
+            className="ml-2 hover:opacity-70"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    );
   };
 
   if (!user) {
@@ -389,6 +477,8 @@ const BusinessDashboard = () => {
 
   return (
     <div className="min-h-screen bg-gray-100">
+      <Notification />
+      
       <div className="bg-white shadow-md">
         <div className="max-w-7xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
@@ -449,10 +539,10 @@ const BusinessDashboard = () => {
 
           <div className="bg-white rounded-lg shadow p-6">
             <div className="flex items-center justify-between mb-2">
-              <div className="text-sm text-gray-600">Customer Rating</div>
+              <div className="text-sm text-gray-600">Avg Rating</div>
               <TrendingUp className="w-5 h-5 text-yellow-600" />
             </div>
-            <div className="text-3xl font-bold text-yellow-600">{stats.avgRating || businessData.rating || 5.0}</div>
+            <div className="text-3xl font-bold text-yellow-600">{stats.avgRating.toFixed(1)}</div>
             <div className="text-xs text-gray-500 mt-1">Out of 5.0</div>
           </div>
         </div>
@@ -516,14 +606,14 @@ const BusinessDashboard = () => {
                               </span>
                             )}
                             <button
-                              onClick={() => markServed(person.id)}
+                              onClick={() => markServed(person.id, person.userName)}
                               className="px-4 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition flex items-center gap-2"
                             >
                               <CheckCircle className="w-4 h-4" />
                               Served
                             </button>
                             <button
-                              onClick={() => markNoShow(person.id)}
+                              onClick={() => markNoShow(person.id, person.userName)}
                               className="px-4 py-2 bg-red-100 text-red-600 rounded-lg font-medium hover:bg-red-200 transition flex items-center gap-2"
                             >
                               <XCircle className="w-4 h-4" />
@@ -568,6 +658,7 @@ const BusinessDashboard = () => {
                     accept="image/*"
                     onChange={handleImageUpload}
                     className="hidden"
+                    disabled={uploadingImage}
                   />
                   <label
                     htmlFor="image-upload"
@@ -634,12 +725,12 @@ const BusinessDashboard = () => {
               </h3>
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-sm text-gray-600">Avg Rating (Today)</span>
-                  <span className="font-bold">{stats.avgRating}/5.0</span>
+                  <span className="text-sm text-gray-600">Avg Rating (All Time)</span>
+                  <span className="font-bold">{stats.avgRating.toFixed(1)}/5.0</span>
                 </div>
                 {stats.actualAvgWaitTime > 0 && (
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600">Actual Avg Wait</span>
+                    <span className="text-sm text-gray-600">Actual Avg Wait (Today)</span>
                     <span className="font-bold">{stats.actualAvgWaitTime} min</span>
                   </div>
                 )}
@@ -652,6 +743,22 @@ const BusinessDashboard = () => {
           </div>
         </div>
       </div>
+
+      <style>{`
+        @keyframes slide-in {
+          from {
+            transform: translateX(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+        .animate-slide-in {
+          animation: slide-in 0.3s ease-out;
+        }
+      `}</style>
     </div>
   );
 };

@@ -147,6 +147,28 @@ const CustomerApp = () => {
 
   const joinQueue = async (business) => {
     try {
+      // Check if user is already in this queue
+      const existingQueueQuery = query(
+        collection(db, 'queue_entries'),
+        where('businessId', '==', business.id),
+        where('userId', '==', userId),
+        where('status', 'in', ['waiting', 'ready'])
+      );
+      
+      const existingSnapshot = await new Promise((resolve) => {
+        const unsubscribe = onSnapshot(existingQueueQuery, (snap) => {
+          unsubscribe();
+          resolve(snap);
+        });
+      });
+
+      if (!existingSnapshot.empty) {
+        alert('You are already in this queue!');
+        setView('myQueues');
+        return;
+      }
+
+      // Get current queue size
       const queueQuery = query(
         collection(db, 'queue_entries'),
         where('businessId', '==', business.id),
@@ -163,6 +185,7 @@ const CustomerApp = () => {
       const currentQueueSize = snapshot.size;
       const position = currentQueueSize + 1;
 
+      // Add to queue
       await addDoc(collection(db, 'queue_entries'), {
         userId: userId,
         userName: userName,
@@ -173,12 +196,13 @@ const CustomerApp = () => {
         position: position,
         status: 'waiting',
         joinedAt: serverTimestamp(),
-        estimatedWait: position * business.avgWaitTime,
+        estimatedWait: position * (business.avgWaitTime || 15),
         notified: false,
         rated: false,
         ratingPromptShown: false
       });
 
+      // Update business queue count
       const businessRef = doc(db, 'businesses', business.id);
       await updateDoc(businessRef, {
         currentQueue: currentQueueSize + 1
@@ -187,34 +211,45 @@ const CustomerApp = () => {
       setView('myQueues');
     } catch (error) {
       console.error('Error joining queue:', error);
-      alert('Failed to join queue. Please try again.');
+      alert('Failed to join queue: ' + error.message);
     }
   };
 
   const leaveQueue = async (queueId, businessId) => {
     try {
+      // Delete the queue entry
       await deleteDoc(doc(db, 'queue_entries', queueId));
       
+      // Get updated queue count
       const queueQuery = query(
         collection(db, 'queue_entries'),
         where('businessId', '==', businessId),
         where('status', 'in', ['waiting', 'ready'])
       );
       
-      const snapshot = await new Promise((resolve) => {
-        const unsubscribe = onSnapshot(queueQuery, (snap) => {
-          unsubscribe();
-          resolve(snap);
-        });
+      const snapshot = await new Promise((resolve, reject) => {
+        const unsubscribe = onSnapshot(queueQuery, 
+          (snap) => {
+            unsubscribe();
+            resolve(snap);
+          },
+          (error) => {
+            unsubscribe();
+            reject(error);
+          }
+        );
       });
 
+      // Update business queue count
       const businessRef = doc(db, 'businesses', businessId);
       await updateDoc(businessRef, {
         currentQueue: snapshot.size
       });
+      
+      console.log('Successfully left queue. New queue size:', snapshot.size);
     } catch (error) {
       console.error('Error leaving queue:', error);
-      alert('Failed to leave queue. Please try again.');
+      alert('Failed to leave queue: ' + error.message);
     }
   };
 
