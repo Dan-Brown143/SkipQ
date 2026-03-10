@@ -21,7 +21,6 @@ const BusinessDashboard = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
-  const [autoCalculateWaitTime, setAutoCalculateWaitTime] = useState(false);
   const [uploadingImage, setUploadingImage] = useState(false);
   
   // In-app notification system
@@ -58,7 +57,6 @@ const BusinessDashboard = () => {
           ...snapshot.docs[0].data()
         };
         setBusinessData(business);
-        setAutoCalculateWaitTime(business.autoCalculateWaitTime || false);
       }
     }, (error) => {
       console.error('Error fetching business:', error);
@@ -113,14 +111,13 @@ const BusinessDashboard = () => {
     return () => unsubscribe();
   }, [businessData]);
 
-  // Calculate statistics - FIXED VERSION
+  // Calculate statistics - SIMPLIFIED (no auto-calculate)
   useEffect(() => {
     if (!businessData) return;
 
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
-    // Query ALL completed entries (not filtered by date in query)
     const completedQuery = query(
       collection(db, 'queue_entries'),
       where('businessId', '==', businessData.id),
@@ -130,28 +127,14 @@ const BusinessDashboard = () => {
     const unsubscribe = onSnapshot(completedQuery, (snapshot) => {
       const allCompleted = snapshot.docs.map(doc => doc.data());
       
-      // Filter for today in JavaScript
+      // Filter for today
       const completedToday = allCompleted.filter(entry => {
         if (!entry.completedAt || !entry.completedAt.seconds) return false;
         const completedDate = new Date(entry.completedAt.seconds * 1000);
         return completedDate >= today;
       });
-      
-      // Calculate actual wait time from today's data
-      const timesWithData = completedToday.filter(entry => 
-        entry.calledAt && entry.completedAt
-      );
-      
-      let avgActualWaitTime = 0;
-      if (timesWithData.length > 0) {
-        const totalWaitMinutes = timesWithData.reduce((sum, entry) => {
-          const waitTime = (entry.completedAt.seconds - entry.calledAt.seconds) / 60;
-          return sum + waitTime;
-        }, 0);
-        avgActualWaitTime = Math.round(totalWaitMinutes / timesWithData.length);
-      }
 
-      // Calculate average rating from ALL completed entries (not just today)
+      // Calculate average rating from ALL completed entries
       const ratedEntries = allCompleted.filter(e => e.rating);
       const avgRating = ratedEntries.length > 0
         ? ratedEntries.reduce((sum, e) => sum + e.rating, 0) / ratedEntries.length
@@ -161,21 +144,14 @@ const BusinessDashboard = () => {
         ...prev,
         todayServed: completedToday.length,
         avgRating: Math.round(avgRating * 10) / 10,
-        actualAvgWaitTime: avgActualWaitTime
+        actualAvgWaitTime: 0 // Not used anymore
       }));
-
-      // Auto-update wait time if enabled
-      if (autoCalculateWaitTime && timesWithData.length >= 5) {
-        updateDoc(doc(db, 'businesses', businessData.id), {
-          avgWaitTime: avgActualWaitTime
-        }).catch(err => console.error('Error updating avgWaitTime:', err));
-      }
     }, (error) => {
       console.error('Error fetching stats:', error);
     });
 
     return () => unsubscribe();
-  }, [businessData, autoCalculateWaitTime]);
+  }, [businessData]);
 
   const handleImageUpload = async (e) => {
     const file = e.target.files[0];
@@ -201,7 +177,7 @@ const BusinessDashboard = () => {
       formData.append('image', file);
       
       // Replace with your actual ImgBB API key
-      const API_KEY = '540e18d4ae9c31f4c2ee1d1b5528908a'; // TODO: Add your key here
+      const API_KEY = 'YOUR_IMGBB_API_KEY'; // TODO: Add your key here
       
       const response = await fetch(`https://api.imgbb.com/1/upload?key=${API_KEY}`, {
         method: 'POST',
@@ -330,29 +306,10 @@ const BusinessDashboard = () => {
       await updateDoc(doc(db, 'businesses', businessData.id), {
         avgWaitTime: parseInt(newTime)
       });
+      showNotification('Average wait time updated', 'success');
     } catch (error) {
       console.error('Error updating service time:', error);
       showNotification('Failed to update service time', 'error');
-    }
-  };
-
-  const toggleAutoCalculate = async () => {
-    if (!businessData) return;
-    
-    const newValue = !autoCalculateWaitTime;
-    setAutoCalculateWaitTime(newValue);
-    
-    try {
-      await updateDoc(doc(db, 'businesses', businessData.id), {
-        autoCalculateWaitTime: newValue
-      });
-      showNotification(
-        newValue ? 'Auto-calculate enabled' : 'Auto-calculate disabled', 
-        'success'
-      );
-    } catch (error) {
-      console.error('Error updating auto-calculate setting:', error);
-      showNotification('Failed to update setting', 'error');
     }
   };
 
@@ -530,11 +487,7 @@ const BusinessDashboard = () => {
               <Clock className="w-5 h-5 text-orange-600" />
             </div>
             <div className="text-3xl font-bold text-orange-600">{businessData.avgWaitTime || 15} min</div>
-            {stats.actualAvgWaitTime > 0 && (
-              <div className="text-xs text-gray-500 mt-1">
-                Actual: {stats.actualAvgWaitTime} min
-              </div>
-            )}
+            <div className="text-xs text-gray-500 mt-1">Per customer</div>
           </div>
 
           <div className="bg-white rounded-lg shadow p-6">
@@ -683,36 +636,18 @@ const BusinessDashboard = () => {
                 <div>
                   <label className="text-sm text-gray-600 mb-1 block">
                     Avg Service Time (minutes)
-                    {autoCalculateWaitTime && (
-                      <span className="ml-2 text-xs text-blue-600">(Auto-calculating)</span>
-                    )}
                   </label>
                   <input
                     type="number"
                     value={businessData.avgWaitTime || 15}
                     onChange={(e) => updateAvgServiceTime(e.target.value)}
-                    disabled={autoCalculateWaitTime}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none disabled:bg-gray-100 disabled:cursor-not-allowed"
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
                     min="1"
                     max="120"
                   />
-                </div>
-
-                <div>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={autoCalculateWaitTime}
-                      onChange={toggleAutoCalculate}
-                      className="w-4 h-4"
-                    />
-                    <span className="text-sm">Auto-calculate wait time from actual data</span>
-                  </label>
-                  {stats.actualAvgWaitTime > 0 && (
-                    <p className="text-xs text-gray-500 mt-1 ml-6">
-                      Based on {stats.todayServed} customers served today
-                    </p>
-                  )}
+                  <p className="text-xs text-gray-500 mt-1">
+                    How long each customer typically takes
+                  </p>
                 </div>
               </div>
             </div>
@@ -728,12 +663,6 @@ const BusinessDashboard = () => {
                   <span className="text-sm text-gray-600">Avg Rating (All Time)</span>
                   <span className="font-bold">{stats.avgRating.toFixed(1)}/5.0</span>
                 </div>
-                {stats.actualAvgWaitTime > 0 && (
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600">Actual Avg Wait (Today)</span>
-                    <span className="font-bold">{stats.actualAvgWaitTime} min</span>
-                  </div>
-                )}
                 <div className="flex items-center justify-between">
                   <span className="text-sm text-gray-600">Total Ratings</span>
                   <span className="font-bold">{businessData.totalRatings || 0}</span>

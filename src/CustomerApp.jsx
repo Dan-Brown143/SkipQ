@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { Clock, MapPin, Users, Bell, CheckCircle, Search, Star, ArrowRight, X } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Clock, MapPin, Users, Bell, CheckCircle, Search, Star, ArrowRight, X, AlertCircle } from 'lucide-react';
 import { db } from './firebase';
-import { collection, query, onSnapshot, addDoc, doc, updateDoc, deleteDoc, serverTimestamp, where, orderBy, getDoc, increment } from 'firebase/firestore';
+import { collection, query, onSnapshot, addDoc, doc, updateDoc, deleteDoc, serverTimestamp, where, getDoc } from 'firebase/firestore';
 
 const CustomerApp = () => {
   const [view, setView] = useState('browse');
@@ -12,6 +12,8 @@ const CustomerApp = () => {
   const [showRatingModal, setShowRatingModal] = useState(false);
   const [ratingData, setRatingData] = useState(null);
   const [selectedRating, setSelectedRating] = useState(0);
+  const [notification, setNotification] = useState(null);
+  
   const [userId] = useState(() => {
     const stored = localStorage.getItem('skipq_user_id');
     if (stored) return stored;
@@ -19,6 +21,7 @@ const CustomerApp = () => {
     localStorage.setItem('skipq_user_id', newId);
     return newId;
   });
+  
   const [userName] = useState(() => {
     const stored = localStorage.getItem('skipq_user_name');
     if (stored) return stored;
@@ -26,6 +29,12 @@ const CustomerApp = () => {
     localStorage.setItem('skipq_user_name', name);
     return name;
   });
+
+  // In-app notification system
+  const showNotification = useCallback((message, type = 'info') => {
+    setNotification({ message, type });
+    setTimeout(() => setNotification(null), 5000);
+  }, []);
 
   useEffect(() => {
     if ('Notification' in window && Notification.permission === 'default') {
@@ -43,10 +52,11 @@ const CustomerApp = () => {
       setBusinesses(businessData);
     }, (error) => {
       console.error('Error fetching businesses:', error);
+      showNotification('Error loading businesses', 'error');
     });
 
     return () => unsubscribe();
-  }, []);
+  }, [showNotification]);
 
   useEffect(() => {
     const q = query(
@@ -61,11 +71,9 @@ const CustomerApp = () => {
         ...doc.data()
       }));
       
-      // Filter for active queues (waiting/ready)
       const activeQueues = queueData.filter(q => q.status === 'waiting' || q.status === 'ready');
       setMyQueues(activeQueues);
 
-      // Check for completed queues that need rating
       const completedNeedRating = queueData.filter(q => 
         q.status === 'completed' && !q.rated && !q.ratingPromptShown
       );
@@ -74,13 +82,11 @@ const CustomerApp = () => {
         const queue = completedNeedRating[0];
         setRatingData(queue);
         setShowRatingModal(true);
-        // Mark as prompted so we don't show again
         updateDoc(doc(db, 'queue_entries', queue.id), {
           ratingPromptShown: true
         });
       }
 
-      // Check for ready notifications
       activeQueues.forEach(queue => {
         if (queue.status === 'ready' && !queue.notified) {
           sendNotification(queue);
@@ -91,10 +97,11 @@ const CustomerApp = () => {
       });
     }, (error) => {
       console.error('Error fetching queue entries:', error);
+      showNotification('Error loading your queues', 'error');
     });
 
     return () => unsubscribe();
-  }, [userId]);
+  }, [userId, showNotification]);
 
   const sendNotification = (queue) => {
     if ('Notification' in window && Notification.permission === 'granted') {
@@ -110,14 +117,12 @@ const CustomerApp = () => {
     if (!ratingData || selectedRating === 0) return;
 
     try {
-      // Update the queue entry with rating
       await updateDoc(doc(db, 'queue_entries', ratingData.id), {
         rating: selectedRating,
         rated: true,
         ratedAt: serverTimestamp()
       });
 
-      // Update business rating
       const businessRef = doc(db, 'businesses', ratingData.businessId);
       const businessSnap = await getDoc(businessRef);
       
@@ -126,12 +131,11 @@ const CustomerApp = () => {
         const currentRating = businessData.rating || 5.0;
         const totalRatings = businessData.totalRatings || 0;
         
-        // Calculate new average rating
         const newTotalRatings = totalRatings + 1;
         const newRating = ((currentRating * totalRatings) + selectedRating) / newTotalRatings;
         
         await updateDoc(businessRef, {
-          rating: Math.round(newRating * 10) / 10, // Round to 1 decimal
+          rating: Math.round(newRating * 10) / 10,
           totalRatings: newTotalRatings
         });
       }
@@ -139,9 +143,10 @@ const CustomerApp = () => {
       setShowRatingModal(false);
       setRatingData(null);
       setSelectedRating(0);
+      showNotification('Thank you for your rating!', 'success');
     } catch (error) {
       console.error('Error submitting rating:', error);
-      alert('Failed to submit rating');
+      showNotification('Failed to submit rating', 'error');
     }
   };
 
@@ -163,7 +168,7 @@ const CustomerApp = () => {
       });
 
       if (!existingSnapshot.empty) {
-        alert('You are already in this queue!');
+        showNotification('You are already in this queue!', 'info');
         setView('myQueues');
         return;
       }
@@ -185,7 +190,6 @@ const CustomerApp = () => {
       const currentQueueSize = snapshot.size;
       const position = currentQueueSize + 1;
 
-      // Add to queue
       await addDoc(collection(db, 'queue_entries'), {
         userId: userId,
         userName: userName,
@@ -202,25 +206,23 @@ const CustomerApp = () => {
         ratingPromptShown: false
       });
 
-      // Update business queue count
       const businessRef = doc(db, 'businesses', business.id);
       await updateDoc(businessRef, {
         currentQueue: currentQueueSize + 1
       });
 
+      showNotification(`Joined queue at ${business.name}!`, 'success');
       setView('myQueues');
     } catch (error) {
       console.error('Error joining queue:', error);
-      alert('Failed to join queue: ' + error.message);
+      showNotification('Failed to join queue: ' + error.message, 'error');
     }
   };
 
-  const leaveQueue = async (queueId, businessId) => {
+  const leaveQueue = async (queueId, businessId, businessName) => {
     try {
-      // Delete the queue entry
       await deleteDoc(doc(db, 'queue_entries', queueId));
       
-      // Get updated queue count
       const queueQuery = query(
         collection(db, 'queue_entries'),
         where('businessId', '==', businessId),
@@ -240,23 +242,57 @@ const CustomerApp = () => {
         );
       });
 
-      // Update business queue count
       const businessRef = doc(db, 'businesses', businessId);
       await updateDoc(businessRef, {
         currentQueue: snapshot.size
       });
       
-      console.log('Successfully left queue. New queue size:', snapshot.size);
+      showNotification(`Left queue at ${businessName}`, 'info');
     } catch (error) {
       console.error('Error leaving queue:', error);
-      alert('Failed to leave queue: ' + error.message);
+      showNotification('Failed to leave queue', 'error');
     }
   };
 
+  // Filter businesses based on search
   const filteredBusinesses = businesses.filter(b => 
     b.name?.toLowerCase().includes(searchTerm.toLowerCase()) ||
     b.category?.toLowerCase().includes(searchTerm.toLowerCase())
   );
+
+  // In-app notification component
+  const Notification = () => {
+    if (!notification) return null;
+
+    const bgColors = {
+      success: 'bg-green-50 border-green-300 text-green-800',
+      error: 'bg-red-50 border-red-300 text-red-800',
+      info: 'bg-blue-50 border-blue-300 text-blue-800'
+    };
+
+    const icons = {
+      success: CheckCircle,
+      error: AlertCircle,
+      info: Bell
+    };
+
+    const Icon = icons[notification.type];
+
+    return (
+      <div className="fixed top-4 right-4 z-50 animate-slide-in">
+        <div className={`flex items-center gap-3 px-4 py-3 rounded-lg border-2 shadow-lg ${bgColors[notification.type]}`}>
+          <Icon className="w-5 h-5 flex-shrink-0" />
+          <span className="font-medium">{notification.message}</span>
+          <button
+            onClick={() => setNotification(null)}
+            className="ml-2 hover:opacity-70"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   const RatingModal = () => {
     if (!showRatingModal || !ratingData) return null;
@@ -308,18 +344,25 @@ const CustomerApp = () => {
     );
   };
 
-  const BrowseView = () => (
-    <div className="space-y-4">
-      <div className="relative">
-        <Search className="absolute left-3 top-3 w-5 h-5 text-gray-400" />
-        <input
-          type="text"
-          placeholder="Search businesses..."
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
-        />
-      </div>
+  // Separate the search handler to prevent re-renders
+  const handleSearchChange = useCallback((e) => {
+    setSearchTerm(e.target.value);
+  }, []);
+
+  const BrowseView = useCallback(() => {
+    return (
+      <div className="space-y-4">
+        <div className="relative">
+          <Search className="absolute left-3 top-3 w-5 h-5 text-gray-400 pointer-events-none" />
+          <input
+            type="text"
+            placeholder="Search businesses..."
+            value={searchTerm}
+            onChange={handleSearchChange}
+            className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+            autoComplete="off"
+          />
+        </div>
 
       {filteredBusinesses.length === 0 ? (
         <div className="text-center py-12">
@@ -358,7 +401,7 @@ const CustomerApp = () => {
                   <p className="text-sm text-gray-600 mb-2">{business.category}</p>
                   <div className="flex items-center gap-1 text-sm text-gray-500 mb-3">
                     <MapPin className="w-4 h-4" />
-                    <span>{business.address}</span>
+                    <span>{business.adress || business.address || 'No address'}</span>
                   </div>
                   <div className="flex items-center gap-4">
                     <div className="flex items-center gap-2">
@@ -381,7 +424,8 @@ const CustomerApp = () => {
         </div>
       )}
     </div>
-  );
+    );
+  }, [filteredBusinesses, handleSearchChange, searchTerm, setSelectedBusiness, setView]);
 
   const QueueView = () => {
     if (!selectedBusiness) return null;
@@ -435,10 +479,12 @@ const CustomerApp = () => {
               </div>
             </div>
 
-            <div className="flex items-center gap-2 text-sm text-gray-600 p-4 bg-gray-50 rounded-lg">
-              <MapPin className="w-4 h-4" />
-              <span>{selectedBusiness.address}</span>
-            </div>
+            {(selectedBusiness.adress || selectedBusiness.address) && (
+              <div className="flex items-center gap-2 text-sm text-gray-600 p-4 bg-gray-50 rounded-lg">
+                <MapPin className="w-4 h-4" />
+                <span>{selectedBusiness.adress || selectedBusiness.address}</span>
+              </div>
+            )}
           </div>
 
           <button
@@ -522,7 +568,7 @@ const CustomerApp = () => {
             </div>
 
             <button
-              onClick={() => leaveQueue(queue.id, queue.businessId)}
+              onClick={() => leaveQueue(queue.id, queue.businessId, queue.businessName)}
               className="w-full py-3 border-2 border-red-300 text-red-600 rounded-lg font-semibold hover:bg-red-50 transition"
             >
               Leave Queue
@@ -535,6 +581,7 @@ const CustomerApp = () => {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
+      <Notification />
       <RatingModal />
       
       <div className="bg-white shadow-md">
@@ -582,6 +629,22 @@ const CustomerApp = () => {
         {view === 'queue' && <QueueView />}
         {view === 'myQueues' && <MyQueuesView />}
       </div>
+
+      <style>{`
+        @keyframes slide-in {
+          from {
+            transform: translateX(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+        .animate-slide-in {
+          animation: slide-in 0.3s ease-out;
+        }
+      `}</style>
     </div>
   );
 };
